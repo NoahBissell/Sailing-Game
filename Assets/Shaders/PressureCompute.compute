@@ -1,0 +1,411 @@
+#include "Assets/Shaders/Hashing.cginc"
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CreateTexture
+#pragma kernel CalculateDensities
+#pragma kernel ProjectPositions
+#pragma kernel UpdateParticles
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+struct Particle
+{
+    float2 position;
+    float2 velocity;
+};
+
+struct Rectangle
+{
+    float2 position;
+    float2x2 rs;
+    float2x2 inv_rs;
+};
+
+struct CircleInfo
+{
+    float radius;
+    float mass;
+    float density;
+};
+
+
+struct CollisionInfo
+{
+    float2 impulse;
+    int circle_index;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWStructuredBuffer<float2> proj_positions;
+StructuredBuffer<Rectangle> rectangles;
+StructuredBuffer<CircleInfo> circle_info;
+StructuredBuffer<Particle> circle_state;
+RWStructuredBuffer<CollisionInfo> collision_info;
+RWStructuredBuffer<float> p_densities;
+StructuredBuffer<int2> c_index_ranges;
+StructuredBuffer<int2> spatial_lookup;
+StructuredBuffer<int2> c_index_ranges_s;
+StructuredBuffer<int2> spatial_lookup_s;
+RWTexture2D<float4> result;
+
+static int2 directions[9] = {int2(0, 0), int2(0, 1), int2(1, 1),
+                        int2(1, 0), int2(1, -1), int2(0, -1),
+                        int2(-1, -1), int2(-1, 0), int2(-1, 1)};
+static float2 vector_components[2] = {float2(1, 0), float2(0, 1)};
+static float2 component_reversals[2] = {float2(-1, 1), float2(1, -1)};
+
+float2 pull_position;
+float2 sample_dimensions;
+float2 sample_origin;
+int2 texture_dimensions;
+uint num_particles;
+uint num_rectangles;
+uint num_circles;
+int bound_half_width_radii;
+float2 gravity;
+float target_density;
+float inv_influence_radius;
+float inv_distribution_volume;
+float inv_pull_radius;
+float inv_sample_radius;
+float inv_distribution_volume_s;
+float pressure_multiplier;
+float influence_radius;
+float sample_radius;
+float pull_strength;
+float delta_time;
+float sim_timestep;
+float particle_mass;
+float bounciness;
+float circle_friction;
+float viscosity;
+float circle_surface_strength;
+
+
+
+float density_distribution(float distance)
+{
+    return clamp(pow(1 - distance * inv_influence_radius, 3), 0, 1); 
+}
+
+float density_distribution(float distance, float inv_r)
+{
+    return clamp(pow(1 - distance * inv_r, 3), 0, 1); 
+}
+
+float density_distribution_slope(float distance)
+{
+    return -3 * sign(distance) * pow(1 - clamp(distance, 0, influence_radius) * inv_influence_radius, 2) * inv_influence_radius;
+}
+
+float viscosity_distribution(float distance)
+{
+    return clamp(pow(1 - pow(distance * inv_influence_radius, 2), 3), 0, 1);
+}
+
+float length_sq(float2 v)
+{
+    return v.x * v.x + v.y * v.y;
+}
+
+float2 texture_to_world_point(uint2 texPoint)
+{
+    return sample_origin + ((float2)texPoint / texture_dimensions) * sample_dimensions;
+}
+
+
+
+void resolve_collision_rect(in Rectangle r, inout Particle p)
+{
+    float2 transformed_offset = mul(r.inv_rs, p.position - r.position);
+    float2 transformed_velocity = mul(r.inv_rs, p.velocity);
+        
+    int min_dir_index = 0;
+    float min_dst = 0;
+    float d_sign = 1;
+        
+    for (int i = 0; i < 2; i++)
+    {
+        float dst = dot(transformed_offset, vector_components[i]);
+        float abs_dst = abs(dst);
+        
+        if (abs_dst >= 1) return;
+        if (abs_dst > min_dst)
+        {
+            d_sign = sign(dst);
+            min_dst = abs_dst;
+            min_dir_index = i;
+        }
+    }
+        
+    transformed_velocity *= component_reversals[min_dir_index];
+    p.velocity = bounciness * mul(r.rs, transformed_velocity);
+    p.position += mul(r.rs, vector_components[min_dir_index] * (1 - min_dst) * d_sign);
+}
+
+void resolve_collision_bounds(Rectangle r, inout Particle p)
+{
+    float2 transformed_offset = mul(r.inv_rs, p.position - r.position);
+    float2 transformed_velocity = mul(r.inv_rs, p.velocity);
+
+    if(abs(transformed_offset.x) > 1)
+    {
+        transformed_offset.x -= 2 * sign(transformed_offset.x);
+        //transformed_velocity.x *= bounciness;
+    }
+    if(abs(transformed_offset.y) > 1)
+    {
+        transformed_offset.y = sign(transformed_offset.y);
+        transformed_velocity.y *= -bounciness;
+    }
+
+    p.position = mul(r.rs, transformed_offset) + r.position;
+    p.velocity = mul(r.rs, transformed_velocity);
+    
+}
+
+void resolve_collision_phys(in CircleInfo c_info, in Particle c, inout CollisionInfo col, inout Particle p)
+{
+    float2 offset = p.position - c.position;
+    float dst = length(offset);
+    
+    if(dst - c_info.radius < 0)
+    {
+        float2 normal = offset / dst;
+        
+        float2 v_zmf = c_info.mass * c.velocity + particle_mass * p.velocity / (c_info.mass + particle_mass);
+        float2 p_impulse_dir = p.velocity - 2 * dot(p.velocity, normal) * normal;
+        float2 c_impulse_dir = c.velocity - 2 * dot(c.velocity, -normal) * -normal;
+
+        p.position = c.position + normal * c_info.radius;
+        p.velocity = p_impulse_dir * bounciness + v_zmf;
+        
+        col.impulse = c_info.mass * (c_impulse_dir * bounciness + v_zmf - c.velocity);
+    }
+    else
+    {
+        col.impulse = float2(0, 0);
+    }
+}
+
+
+float2 pressure_gradient(int p_index)
+{
+    float current_density = p_densities[p_index];
+    float2 gradient;
+    float2 position = proj_positions[p_index];
+    int2 coord = get_quantized_coord(position, influence_radius);
+    for(int cell = 0; cell < 9; cell++)
+    {
+        int2 neighbor_coord = coord + directions[cell];
+        bool wrapped = false;
+        if (neighbor_coord.x == bound_half_width_radii)
+        {
+            neighbor_coord = int2(-bound_half_width_radii, neighbor_coord.y);
+            wrapped = true;
+        }
+        else if (neighbor_coord.x == -bound_half_width_radii - 1)
+        {
+            neighbor_coord = int2(bound_half_width_radii - 1, neighbor_coord.y);
+            wrapped = true;
+        }
+
+        int cell_hash = hash_position(neighbor_coord, num_particles);
+        for(int i = c_index_ranges[cell_hash].x; i < c_index_ranges[cell_hash].y; i++)
+        {
+            int other_p_index = spatial_lookup[i].x;
+            if(other_p_index == p_index) continue;
+
+            float2 offset = position - proj_positions[other_p_index];
+            if (wrapped)
+            {
+                offset.x = offset.x - sign(offset.x) * bound_half_width_radii * 2 * influence_radius;
+            }
+            
+            float dst = length(offset);
+
+            if (dst > influence_radius) continue;
+            float2 offset_normalized = dst == 0 ? float2(1, 0) : normalize(offset);
+
+            float slope = density_distribution_slope(dst);
+            float density = p_densities[other_p_index];
+
+            float shared_pressure = 0.5f * ((target_density - density) + (target_density - current_density));
+
+            gradient += slope * shared_pressure * offset_normalized;
+
+            gradient += viscosity * viscosity_distribution(dst) * (particles[other_p_index].velocity - particles[p_index].velocity);
+        }
+    }
+
+    
+    for(int c_index = 0; c_index < num_circles; c_index++)
+    {
+        float dst = distance(circle_state[c_index].position, position) - circle_info[c_index].radius;
+        if(dst > influence_radius) continue;
+        
+        float2 offset = position - circle_state[c_index].position;
+        float2 offset_normalized = normalize(offset);
+
+        float cont = density_distribution(dst);
+        gradient += circle_surface_strength * cont * offset_normalized;
+        gradient += cont * circle_friction * (circle_state[c_index].velocity - particles[p_index].velocity);
+        
+        collision_info[p_index].impulse = cont * -offset_normalized;
+        collision_info[p_index].circle_index = c_index;
+    }
+
+    
+    gradient += (pull_position - proj_positions[p_index]) * pull_strength *
+        density_distribution(distance(pull_position, proj_positions[p_index]), inv_pull_radius);
+    return gradient * inv_distribution_volume;
+}
+
+
+[numthreads(8,8,1)]
+void CreateTexture (uint3 id : SV_DispatchThreadID)
+{
+    // TODO: insert actual code here!
+
+    float density = 0;
+    float2 velocity = 0;
+    float2 position = texture_to_world_point(id.xy);
+    float n = 0;
+    int2 coord = get_quantized_coord(position, sample_radius);
+    for (int cell = 0; cell < 9; cell++)
+    {
+        int cell_hash = hash_position(coord + directions[cell], num_particles);
+        for(int i = c_index_ranges_s[cell_hash].x; i < c_index_ranges_s[cell_hash].y; i++)
+        {
+            int p_index = spatial_lookup_s[i].x;
+            float contribution = density_distribution(distance(particles[p_index].position, position), inv_sample_radius);
+            // float in_range = ceil(contribution);
+            n += contribution;
+            density += contribution;
+            
+            velocity += contribution * particles[p_index].velocity;
+        }
+    }
+    // for(int c = 0; c < num_circles; c++)
+    // {
+    //     density += density_distribution(distance(circle_state[c].position, position) - circle_info[c].radius) * circle_info[c].density;
+    // }
+    density *= inv_distribution_volume_s;
+    
+    velocity /= n > 0 ? n : 1;
+    // float speed = (length(velocity) + 4 * n) / n;
+    
+    float chaos = 0;
+    for (int cell = 0; cell < 9; cell++)
+    {
+        int cell_hash = hash_position(coord + directions[cell], num_particles);
+        for(int i = c_index_ranges_s[cell_hash].x; i < c_index_ranges_s[cell_hash].y; i++)
+        {
+            int p_index = spatial_lookup_s[i].x;
+            float contribution = density_distribution(distance(particles[p_index].position, position), inv_sample_radius);
+            chaos += contribution * distance(velocity, particles[p_index].velocity);
+        }
+    }
+    chaos *= inv_distribution_volume_s;
+    
+    float f = clamp(density / target_density, 0, 1.5);
+    
+    // result[id.xy] = float4(chaos / 300, -16*(f-1)*(f-1)+1, -16*(f-1.25)*(f-1.25)+1, 1);
+    result[id.xy] = float4(chaos, density / target_density, velocity);
+}
+
+[numthreads(64,1,1)]
+void CalculateDensities(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < 0 || id.x >= num_particles) { return; }
+    
+    int p_index = id.x;
+
+    float density = 0;
+    float2 position = proj_positions[p_index];
+    int2 coord = get_quantized_coord(position, influence_radius);
+    for (int cell = 0; cell < 9; cell++)
+    {
+        int2 neighbor_coord = coord + directions[cell];
+        bool wrapped = false;
+        if (neighbor_coord.x == bound_half_width_radii)
+        {
+            neighbor_coord = int2(-bound_half_width_radii, neighbor_coord.y);
+            wrapped = true;
+        }
+        else if (neighbor_coord.x == -bound_half_width_radii - 1)
+        {
+            neighbor_coord = int2(bound_half_width_radii - 1, neighbor_coord.y);
+            wrapped = true;
+        }
+        int cell_hash = hash_position(neighbor_coord, num_particles);
+        for(int i = c_index_ranges[cell_hash].x; i < c_index_ranges[cell_hash].y; i++)
+        {
+            int other_p_index = spatial_lookup[i].x;
+            if (other_p_index == p_index)
+            {
+                density += 1;
+                continue;
+            }
+            float2 offset = position - proj_positions[other_p_index];
+            if (wrapped)
+            {
+                offset.x = offset.x - sign(offset.x) * bound_half_width_radii * 2 * influence_radius;
+            }
+            
+            density += density_distribution(length(offset));
+        }
+    }
+
+    p_densities[p_index] = density * inv_distribution_volume;
+}
+
+[numthreads(64,1,1)]
+void ProjectPositions (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < 0 || id.x >= num_particles) { return; }
+
+    int index = id.x;
+
+    proj_positions[index] = particles[index].position + particles[index].velocity * sim_timestep;
+
+    if (proj_positions[index].x > bound_half_width_radii * influence_radius ||
+        proj_positions[index].x < -bound_half_width_radii * influence_radius)
+    {
+        proj_positions[index].x -= 2 * sign(proj_positions[index].x) * bound_half_width_radii * influence_radius;
+    }
+}
+
+[numthreads(64,1,1)]
+void UpdateParticles (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < 0 || id.x >= num_particles) { return; }
+    
+    int index = id.x;
+
+    collision_info[index].circle_index = -1;
+    
+    Particle p = particles[index];
+    float2 gradient = pressure_gradient(index);
+    p.velocity += (gravity - gradient * pressure_multiplier / p_densities[index]) * delta_time;
+    
+    // for(int r_index = 0; r_index < num_rectangles; r_index++)
+    // {
+    //     resolve_collision_rect(rectangles[r_index], p);
+    // }
+    resolve_collision_bounds(rectangles[0], p);
+
+    // for(int c_index = 0; c_index < num_circles; c_index++)
+    // {
+    //     CollisionInfo col = collision_info[index];
+    //     resolve_collision_phys(circle_info[c_index], circle_state[c_index], col, p);
+    //     col.circle_index = c_index;
+    //     collision_info[index] = col;
+    // }
+
+    p.position += p.velocity * delta_time;
+    
+    particles[index] = p;
+}
+
+

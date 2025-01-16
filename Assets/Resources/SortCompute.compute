@@ -1,0 +1,92 @@
+#include "Assets/Shaders/Hashing.cginc"
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma target 5.0
+#pragma kernel HashPositions
+#pragma kernel BitonicSwaps
+#pragma kernel GetRanges
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<int2> spatial_lookup;
+RWStructuredBuffer<int2> c_index_ranges;
+StructuredBuffer<int2> comp_indices;
+RWStructuredBuffer<float2> positions;
+
+int num_particles;
+int num_comparators;
+float cell_size;
+
+int comp_offset;
+int group_size;
+
+void swap(int i, int j)
+{
+    int2 temp = spatial_lookup[i];
+    spatial_lookup[i] = spatial_lookup[j];
+    spatial_lookup[j] = temp;
+}
+
+[numthreads(64,1,1)]
+void HashPositions (uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x;
+    if(index >= num_particles || index < 0) { return; }
+    
+    spatial_lookup[index] = int2(index, hash_position(positions[index], cell_size, num_particles));
+    c_index_ranges[index] = int2(0, 0);
+}
+
+// [numthreads(32,1,1)]
+// void Swap (uint3 id : SV_DispatchThreadID)
+// {
+//     int comparator_index = id.x;
+//     
+//     if(comp_indices[comparator_index].y >= num_particles)
+//     {
+//         return;
+//     }
+//     if(spatial_lookup[comp_indices[comparator_index].x].y > spatial_lookup[comp_indices[comparator_index].y].y)
+//     {
+//         int2 temp = spatial_lookup[comp_indices[comparator_index].x];
+//         spatial_lookup[comp_indices[comparator_index].x] = spatial_lookup[comp_indices[comparator_index].y];
+//         spatial_lookup[comp_indices[comparator_index].y] = temp;
+//     }
+// }
+
+[numthreads(64,1,1)]
+void BitonicSwaps (uint3 id : SV_DispatchThreadID)
+{
+    int p_index = id.x;
+    
+    int other_p_index = p_index ^ comp_offset;
+    if(other_p_index > p_index && other_p_index < num_particles)
+    {
+        if(((p_index & group_size) == 0 && spatial_lookup[p_index].y < spatial_lookup[other_p_index].y) ||
+            ((p_index & group_size) != 0 && spatial_lookup[p_index].y > spatial_lookup[other_p_index].y))
+        {
+            swap(p_index, other_p_index);
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void GetRanges(uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x;
+    if(index >= num_particles || index < 0) { return; }
+    
+    if(index == 0)
+    {
+        c_index_ranges[spatial_lookup[0].y].x = 0;
+        c_index_ranges[spatial_lookup[num_particles - 1].y].y = num_particles;
+        return;
+    }
+    
+    if(spatial_lookup[index].y == spatial_lookup[index - 1].y)
+    {
+        return;
+    }
+    c_index_ranges[spatial_lookup[index - 1].y].y = index;
+    c_index_ranges[spatial_lookup[index].y].x = index;
+}
