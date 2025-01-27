@@ -7,6 +7,7 @@ using Unity.Collections;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
+using UnityEngine.Serialization;
 using Random = UnityEngine.Random;
 
 public class FluidSimulation : MonoBehaviour
@@ -23,6 +24,9 @@ public class FluidSimulation : MonoBehaviour
     };
     private static readonly float2[] VectorComponents = {new(1, 0), new(0, 1)};
     private static readonly float2[] ComponentReversals = {new(-1, 1), new(1, -1)};
+
+    public float2 offsetVelocity;
+    public BoatCamera camController;
     
     public int numParticles;
     public float totalMass;
@@ -47,6 +51,7 @@ public class FluidSimulation : MonoBehaviour
 
     public Transform[] rectangles;
     public Rigidbody2D[] circles;
+    public Buoyant[] buoyants;
 
     public Material fluidMaterial;
     public ComputeShader fluidCompute;
@@ -103,6 +108,24 @@ public class FluidSimulation : MonoBehaviour
     private SpatialLookup _sampleLookup;
     
     private AsyncGPUReadbackRequest _collisionReadback;
+
+    [Serializable]
+    public struct Buoyant
+    {
+        public Rigidbody2D rb;
+        public Buoy[] buoys;
+    }
+    
+    [Serializable]
+    public struct Buoy
+    {
+        public Transform transform;
+        public float mass;
+        public float radius;
+        [HideInInspector] public float offset;
+    }
+
+    
 
     public struct Rectangle
     {
@@ -246,10 +269,21 @@ public class FluidSimulation : MonoBehaviour
         
         _circleInfo = new CircleInfo[circles.Length];
         _circleStates = new Particle[circles.Length];
-        for (int i = 0; i < circles.Length; i++)
+        // for (int i = 0; i < circles.Length; i++)
+        // {
+        //     _circleStates[i] = new Particle(circles[i].position, circles[i].linearVelocity);
+        //     _circleInfo[i] = new CircleInfo(circles[i].transform.localScale.x * .5f, circles[i].mass);
+        // }
+        int circleIndex = 0;
+        for (int i = 0; i < buoyants.Length; i++)
         {
-            _circleStates[i] = new Particle(circles[i].position, circles[i].linearVelocity);
-            _circleInfo[i] = new CircleInfo(circles[i].transform.localScale.x * .5f, circles[i].mass);
+            Buoyant b = buoyants[i];
+            for (int j = 0; j < buoyants[i].buoys.Length; j++)
+            {
+                _circleStates[circleIndex] = new Particle(b.buoys[j].transform.position, float2.zero);
+                _circleInfo[circleIndex] = new CircleInfo(b.buoys[j].radius, b.buoys[j].mass);
+                circleIndex++;
+            }
         }
         
         _particleBuffer = new ComputeBuffer(numParticles, sizeof(float) * 2 * 2);
@@ -358,6 +392,7 @@ public class FluidSimulation : MonoBehaviour
         fluidCompute.SetFloat("influence_radius", influenceRadius);
         fluidCompute.SetFloat("sample_radius", sampleRadius);
         fluidCompute.SetFloats("gravity", new float[]{gravity.x, gravity.y});
+        fluidCompute.SetFloats("offset_velocity", new float[]{offsetVelocity.x, offsetVelocity.y});
         fluidCompute.SetFloat("sim_timestep", simTimeStep);
         fluidCompute.SetFloat("pull_strength", pullStrength);
         fluidCompute.SetFloat("particle_mass", totalMass / numParticles);
@@ -417,10 +452,22 @@ public class FluidSimulation : MonoBehaviour
 
     void UpdateCircles()
     {
-        for (int i = 0; i < circles.Length; i++)
+        // for (int i = 0; i < circles.Length; i++)
+        // {
+        //     _circleStates[i].Position = circles[i].position;
+        //     _circleStates[i].Velocity = circles[i].linearVelocity;
+        // }
+        int circleIndex = 0;
+        for (int i = 0; i < buoyants.Length; i++)
         {
-            _circleStates[i].Position = circles[i].position;
-            _circleStates[i].Velocity = circles[i].linearVelocity;
+            Buoyant b = buoyants[i];
+            for (int j = 0; j < buoyants[i].buoys.Length; j++)
+            {
+                float2 velocity = ((float2)(Vector2)b.buoys[j].transform.position - (float2)camController.GetOffset() - _circleStates[circleIndex].Position) / Time.deltaTime;
+                _circleStates[circleIndex].Position = (Vector2)b.buoys[j].transform.position - camController.GetOffset();
+                _circleStates[circleIndex].Velocity = velocity;
+                circleIndex++;
+            }
         }
     }
 
@@ -434,9 +481,18 @@ public class FluidSimulation : MonoBehaviour
                 impulses[_collisionInfo[i].CircleIndex] += _collisionInfo[i].Impulse;
             }
         }
-        for (int i = 0; i < circles.Length; i++)
+        // for (int i = 0; i < circles.Length; i++)
+        // {
+        //     circles[i].AddForce(impulses[i] / Time.fixedDeltaTime);
+        // }
+        int circleIndex = 0;
+        for (int i = 0; i < buoyants.Length; i++)
         {
-            circles[i].AddForce(impulses[i] / Time.fixedDeltaTime);
+            Buoyant b = buoyants[i];
+            for (int j = 0; j < buoyants[i].buoys.Length; j++){
+                b.rb.AddForceAtPosition(impulses[circleIndex] / Time.fixedDeltaTime, b.buoys[j].transform.position);
+                circleIndex++;
+            }
         }
     }
 
@@ -453,14 +509,20 @@ public class FluidSimulation : MonoBehaviour
         // if (_collisionReadback.done)
         // {
         //     ApplyCircleForces();
-        //     // print("whatup");
         //     // UpdateCircles();
         //     // _circleStateBuffer.SetData(_circleStates);
         //     _collisionReadback = AsyncGPUReadback.RequestIntoNativeArray(ref _collisionInfo, _collisionInfoBuffer);
         // }
         
+        // float vx = target.linearVelocityX;
+        // target.linearVelocityX -= vx;
+        // fluidCompute.SetFloats("offset_velocity", new float[]{-vx, 0});
+        float2 camVelocity = camController.GetVelocity();
+        fluidCompute.SetFloats("offset_velocity", new float[]{-camVelocity.x, -camVelocity.y});
+        
         _collisionInfoBuffer.GetData(_collisionInfo);
         ApplyCircleForces();
+        
         
     }
 
@@ -496,7 +558,7 @@ public class FluidSimulation : MonoBehaviour
         {
             Vector3 pos = Camera.main.ScreenToWorldPoint(Input.mousePosition) - Vector3.forward;
             //print(GetQuantizedCoord(new float2(pos.x, pos.y), influenceRadius));
-            pullPosition = (Vector2)pos;
+            pullPosition = (Vector2)pos - camController.GetOffset();
         }
         else
         {

@@ -63,6 +63,8 @@ uint num_rectangles;
 uint num_circles;
 int bound_half_width_radii;
 float2 gravity;
+float2 offset_velocity;
+// float2 delta_offset_velocity;
 float target_density;
 float inv_influence_radius;
 float inv_distribution_volume;
@@ -403,7 +405,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     //     collision_info[index] = col;
     // }
 
-    p.position += p.velocity * delta_time;
+    p.position += (p.velocity + offset_velocity) * delta_time;
     
     particles[index] = p;
 }
