@@ -5,4 +5,4 @@ This was a small hobby project implementing a 2D SPH fluid simulation in compute
 [![Video](https://img.youtube.com/vi/dc81n-_lkXc/0.jpg)](www.youtube.com)
 
 
-https://noahbissell.myportfolio.com/
+https://noahbissell.myportfolio.com/sph-fluid-sim
